@@ -5,11 +5,40 @@
 - `oc` CLI logged into the cluster
 - `huggingface-cli` installed (`pip install huggingface-hub`)
 
+## Background
+
+Researchers in the MOC needed to deploy the Qwen3-TTS model, which required a vLLM-omni ServingRuntime in RHOAI. An [existing ServingRuntime by @vraiti](https://github.com/vraiti/omni-kserve/blob/e8a5dd6dd9216977f2cc122e9c334ec605186174/01-servingruntime.yaml) assumed models would be pulled directly from HuggingFace. However, we typically deploy models from S3 storage because researchers fine-tune model weights, save changes back to S3, and redeploy. So the ServingRuntime needed modifications to support S3 based model deployment. Another option is to [containerize the model and deploy it via modelcar](https://github.com/cbtham/rhoai-genai-workshop?tab=readme-ov-file#11-option-1-using-a-pre-built-llm-container-faster), but that requires rebuilding and pushing a new image after every fine-tuning iteration, which doesn't fit the researcher workflow.
+
+
+### Why this ServingRuntime is Qwen3-TTS-specific
+
+At a high level, the ServingRuntime serves whatever model is in `/mnt/models` using a single image (`vllm/vllm-omni`) and a single command pattern (`vllm serve <path> --omni`). However, you cannot simply run `vllm serve /mnt/models --omni` for Qwen3-TTS because vLLM-omni's [Qwen3-TTS-specific code](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts.py) infers a "task type" from the model path. For Qwen3-TTS there are three task types that map to three different generation methods:
+
+| Task type | Generation method | Use case |
+|---|---|---|
+| **CustomVoice** | `generate_custom_voice()` | Predefined speakers (e.g. "vivian") |
+| **VoiceDesign** | `generate_voice_design()` | Design a voice from instructions |
+| **Base** | `generate_voice_clone()` | Clone from reference audio |
+
+So for a path like `.../Qwen3-TTS-12Hz-1.7B-CustomVoice`, it grabs `CustomVoice`. If you pass `/mnt/models`, it produces `mnt` or `models` and fails with `Invalid task type: mnt/models`.
+
+The workaround is a symlink: create `/tmp/Qwen/${HF_MODEL_NAME}` pointing to `/mnt/models`, then run `vllm serve /tmp/Qwen/${HF_MODEL_NAME}`. That way vLLM-omni gets the model name string (to infer task type) while the OS follows the symlink to read the actual weights from `/mnt/models`.
+
+### Toward a universal vLLM-omni ServingRuntime
+
+In an ideal world, we would have a single "vLLM-omni" ServingRuntime that supports deployments from S3, HuggingFace, or sidecar for any multi-modal model, similar to the default vLLM ServingRuntime for KServe that ships with RHOAI.
+
+This is not straightforward today because within vLLM-omni, each supported model has its own specific code (under `vllm_omni/model_executor/models/`) and each model's code may make different assumptions about path structure, config format, or expected arguments. For example:
+
+- **Qwen3-TTS** infers task type from the model path and expects a HuggingFace-style path name.
+- **GLM-TTS** does not even have a `config.json` at the root level of the model.
+- Other omni models (CosyVoice3, FLUX, Qwen3-Omni, etc.) have their own pipelines and assumptions.
+
+We plan to submit an RFC to upstream [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) to standardize the expected repository structure.
+
 ## Current Limitations
 
-This vllm-omni ServingRuntime can only be used to deploy Qwen3-TTS-12Hz-1.7B-CustomVoice model or other variants of Qwen3-TTS given that you change env variable in the ServingRuntime as outlined in section 3. I am still working on creating a vLLM Omni ServingRuntime that can work with any multi-modal Model. 
-
-This guide also specifically goes over how to deploy the model by downloading it and deploying it from S3 storage. But it is also possible to [containerize the model and deploy it via modelcar](https://github.com/cbtham/rhoai-genai-workshop?tab=readme-ov-file#11-option-1-using-a-pre-built-llm-container-faster). The other option is also creating an `InferenceService` definition that points to your S3 storage. But for now this will just cover deploying it from S3 Storage.
+This ServingRuntime can only be used to deploy Qwen3-TTS variants (CustomVoice, VoiceDesign, Base). To deploy a different variant, change the `HF_MODEL_NAME` env var in the ServingRuntime as outlined in section 3. Other vLLM-omni models may work without the symlink hack but have not been tested.
 
 ## 1. Deploying Minio S3 Storage
 
@@ -231,4 +260,8 @@ aplay output.wav
 
 - [Qwen3-TTS on HuggingFace](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)
 - [vLLM-Omni Qwen3-TTS Documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/examples/online_serving/qwen3_tts/)
+- [vLLM-Omni Supported Models](https://docs.vllm.ai/projects/vllm-omni/en/latest/models/supported_models/)
+- [vLLM-Omni GitHub](https://github.com/vllm-project/vllm-omni)
+- [vLLM-Omni Qwen3-TTS source (task type logic)](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts.py)
+- [@vraiti's omni-kserve ServingRuntime](https://github.com/vraiti/omni-kserve/blob/e8a5dd6dd9216977f2cc122e9c334ec605186174/01-servingruntime.yaml)
 - [Guide to Deploying AI Models on RHOAI](https://github.com/IsaiahStapleton/rhoai-model-deployment-guide)
