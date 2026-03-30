@@ -1,4 +1,4 @@
-# Deploying Qwen3-TTS-12Hz-1.7B-CustomVoice on RHOAI
+# Deploying Qwen3-TTS Models on RHOAI
 
 ## Prerequisites
 
@@ -9,10 +9,9 @@
 
 Researchers in the MOC needed to deploy the Qwen3-TTS model, which required a vLLM-omni ServingRuntime in RHOAI. An [existing ServingRuntime by @vraiti](https://github.com/vraiti/omni-kserve/blob/e8a5dd6dd9216977f2cc122e9c334ec605186174/01-servingruntime.yaml) assumed models would be pulled directly from HuggingFace. However, we typically deploy models from S3 storage because researchers fine-tune model weights, save changes back to S3, and redeploy. So the ServingRuntime needed modifications to support S3 based model deployment. Another option is to [containerize the model and deploy it via modelcar](https://github.com/cbtham/rhoai-genai-workshop?tab=readme-ov-file#11-option-1-using-a-pre-built-llm-container-faster), but that requires rebuilding and pushing a new image after every fine-tuning iteration, which doesn't fit the researcher workflow.
 
-
 ### Why this ServingRuntime is Qwen3-TTS-specific
 
-At a high level, the ServingRuntime serves whatever model is in `/mnt/models` using a single image (`vllm/vllm-omni`) and a single command pattern (`vllm serve <path> --omni`). However, you cannot simply run `vllm serve /mnt/models --omni` for Qwen3-TTS because vLLM-omni's [Qwen3-TTS-specific code](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/model_executor/models/qwen3_tts/qwen3_tts.py) infers a "task type" from the model path. For Qwen3-TTS there are three task types that map to three different generation methods:
+At a high level, the ServingRuntime serves whatever model is in `/mnt/models` using a single image (`vllm/vllm-omni`) and a single command pattern (`vllm serve <path> --omni`). Qwen3-TTS requires a "task type" to determine which generation method to use. There are three task types:
 
 | Task type | Generation method | Use case |
 |---|---|---|
@@ -20,25 +19,12 @@ At a high level, the ServingRuntime serves whatever model is in `/mnt/models` us
 | **VoiceDesign** | `generate_voice_design()` | Design a voice from instructions |
 | **Base** | `generate_voice_clone()` | Clone from reference audio |
 
-So for a path like `.../Qwen3-TTS-12Hz-1.7B-CustomVoice`, it grabs `CustomVoice`. If you pass `/mnt/models`, it produces `mnt` or `models` and fails with `Invalid task type: mnt/models`.
+The `--task-type` flag on `vllm serve` specifies which task type to use. The ServingRuntime sets this via the `TASK_TYPE` environment variable, which defaults to `CustomVoice`. To deploy a different variant, override `TASK_TYPE` in the InferenceService — no separate ServingRuntime is needed (see section 3).
 
-The workaround is a symlink: create `/tmp/Qwen/${HF_MODEL_NAME}` pointing to `/mnt/models`, then run `vllm serve /tmp/Qwen/${HF_MODEL_NAME}`. That way vLLM-omni gets the model name string (to infer task type) while the OS follows the symlink to read the actual weights from `/mnt/models`.
-
-### Toward a universal vLLM-omni ServingRuntime
-
-In an ideal world, we would have a single "vLLM-omni" ServingRuntime that supports deployments from S3, HuggingFace, or sidecar for any multi-modal model, similar to the default vLLM ServingRuntime for KServe that ships with RHOAI.
-
-This is not straightforward today because within vLLM-omni, each supported model has its own specific code (under `vllm_omni/model_executor/models/`) and each model's code may make different assumptions about path structure, config format, or expected arguments. For example:
-
-- **Qwen3-TTS** infers task type from the model path and expects a HuggingFace-style path name.
-- **GLM-TTS** does not even have a `config.json` at the root level of the model.
-- Other omni models (CosyVoice3, FLUX, Qwen3-Omni, etc.) have their own pipelines and assumptions.
-
-We plan to submit an RFC to upstream [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) to standardize the expected repository structure.
 
 ## Current Limitations
 
-This ServingRuntime can only be used to deploy Qwen3-TTS variants (CustomVoice, VoiceDesign, Base). To deploy a different variant, change the `HF_MODEL_NAME` env var in the ServingRuntime as outlined in section 3. Other vLLM-omni models may work without the symlink hack but have not been tested.
+This ServingRuntime supports all Qwen3-TTS variants (CustomVoice, VoiceDesign, Base) via the `TASK_TYPE` env var, which can be overridden per InferenceService deployment (see section 3). Other vLLM-omni models have not been tested with this ServingRuntime.
 
 ## 1. Deploying Minio S3 Storage
 
@@ -106,47 +92,40 @@ This downloads approximately 3.5 GB.
 
 ## 3. ServingRuntime
 
-The vLLM-Omni ServingRuntime (`vllm-qwen3-tts-omni-runtime`) is already applied to the cluster. It uses the `HF_MODEL_NAME` environment variable to determine which Qwen3-TTS variant to load.
+The vLLM-Omni ServingRuntime (`vllm-qwen3-tts-omni-runtime`) is already applied to the cluster. It uses the `TASK_TYPE` environment variable to pass the `--task-type` flag to `vllm serve`, which determines which Qwen3-TTS generation method to use. The default is `CustomVoice`, but this can be overridden per InferenceService deployment. One ServingRuntime supports all Qwen3-TTS task types.
 
-If you want to deploy a different variant, create a new ServingRuntime with a different `HF_MODEL_NAME` value:
+The ServingRuntime definition:
 
-```bash
-oc get servingruntime vllm-qwen3-tts-omni-runtime -n <your-namespace> -o yaml > my-servingruntime.yaml
-```
-
-The ServingRuntime definition is also here:
-
-```
+```yaml
 apiVersion: serving.kserve.io/v1alpha1
 kind: ServingRuntime
 metadata:
-  name: vllm-qwen3-tts-omni-runtime
   annotations:
-    openshift.io/display-name: vLLM-Omni Qwen3-TTS-12Hz-1.7B-CustomVoice
-    opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
     opendatahub.io/apiProtocol: REST
+    opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
+    opendatahub.io/runtime-version: v0.18.0
+    openshift.io/display-name: vLLM-Omni Qwen3-TTS
+  labels:
+    opendatahub.io/dashboard: "true"
+  name: vllm-qwen3-tts-omni-runtime
 spec:
   annotations:
     prometheus.io/path: /metrics
     prometheus.io/port: "8000"
-  supportedModelFormats:
-    - name: vllm-omni
-      autoSelect: true
   containers:
-    - name: kserve-container
-      image: vllm/vllm-omni:v0.14.0
+    - args:
+        - |
+          exec vllm serve /mnt/models --omni --task-type ${TASK_TYPE} \
+            --host 0.0.0.0 --port 8000 --served-model-name={{.Name}} \
+            --trust-remote-code --enforce-eager ${EXTRA_ARGS}
       command:
         - /bin/sh
         - -c
-      args:
-        - >
-          mkdir -p /tmp/Qwen && ln -sf /mnt/models /tmp/Qwen/${HF_MODEL_NAME} &&
-          exec vllm serve /tmp/Qwen/${HF_MODEL_NAME} --omni --host 0.0.0.0
-          --port 8000 --served-model-name={{.Name}} --trust-remote-code
-          --enforce-eager
       env:
-        - name: HF_MODEL_NAME
-          value: Qwen3-TTS-12Hz-1.7B-CustomVoice
+        - name: TASK_TYPE
+          value: CustomVoice
+        - name: EXTRA_ARGS
+          value: ""
         - name: HOME
           value: /tmp
         - name: HF_HOME
@@ -155,43 +134,35 @@ spec:
           value: /tmp/numba_cache
         - name: MPLCONFIGDIR
           value: /tmp/matplotlib
+      image: vllm/vllm-omni:v0.18.0
+      name: kserve-container
       ports:
-        - name: http
-          containerPort: 8000
+        - containerPort: 8000
+          name: http
           protocol: TCP
       resources:
-        requests:
-          memory: 16Gi
-          cpu: "4"
-          nvidia.com/gpu: "1"
         limits:
-          memory: 32Gi
           cpu: "8"
+          memory: 32Gi
+          nvidia.com/gpu: "1"
+        requests:
+          cpu: "4"
+          memory: 16Gi
           nvidia.com/gpu: "1"
       volumeMounts:
-        - name: shm
-          mountPath: /dev/shm
+        - mountPath: /dev/shm
+          name: shm
+  multiModel: false
+  supportedModelFormats:
+    - autoSelect: true
+      name: vllm-omni
   volumes:
-    - name: shm
-      emptyDir:
+    - emptyDir:
         medium: Memory
         sizeLimit: 8Gi
-  multiModel: false
-
+      name: shm
 ```
 
-Edit the `HF_MODEL_NAME` env var to match the variant you uploaded to S3:
-
-```yaml
-- name: HF_MODEL_NAME
-  value: Qwen3-TTS-12Hz-1.7B-VoiceDesign
-```
-
-Then apply the new ServingRuntime:
-
-```bash
-oc apply -f my-servingruntime.yaml -n <your-namespace>
-```
 
 ## 4. Deploying the Model on RHOAI
 
@@ -204,7 +175,8 @@ oc apply -f my-servingruntime.yaml -n <your-namespace>
    - **Accelerator**: NVIDIA GPU
    - **Model route**: Check **Make deployed models available through an external route**
    - **Token authentication**: Check **Require token authentication**
-   - **Source model location**: Select the Minio Data Connection, then set the path to `Qwen3-TTS-12Hz-1.7B-CustomVoice`
+   - **Source model location**: Select the Minio Data Connection, then set the path to your model folder (e.g. `Qwen3-TTS-12Hz-1.7B-CustomVoice` for the CustomVoice weights from [section 2.1](#21-download-the-model))
+   - **Configuration parameters**: The ServingRuntime defaults to `TASK_TYPE=CustomVoice`. If you are deploying a different Qwen3-TTS variant (VoiceDesign or Base weights, or any checkpoint whose task type is not CustomVoice), add an environment variable **`TASK_TYPE`** with the matching value: `CustomVoice`, `VoiceDesign`, or `Base` (see the task type table in [Background](#background)). Values set here override the runtime default. You can also set **`EXTRA_ARGS`** here for specific vLLM flags (e.g. `--max-model-len 4096`).
 4. Click **Deploy**
 
 The model will take a few minutes to load. Once the pod status shows **Ready**, proceed to testing.
@@ -249,7 +221,7 @@ aplay output.wav
 
 | Issue | Fix |
 |---|---|
-| `Invalid task type: mnt/models` | The `HF_MODEL_NAME` env var in the ServingRuntime doesn't match the model uploaded to S3. |
+| `Invalid task type` | The `TASK_TYPE` env var is not set to a valid value. Must be one of `CustomVoice`, `VoiceDesign`, or `Base`. Check both the ServingRuntime default and any InferenceService override. |
 | Model pod OOMKilled | Increase memory limits. The 1.7B model needs ~8 GB RAM + GPU VRAM. |
 | Pod terminates shortly after starting | Check logs with `oc logs <pod-name> -n <namespace>`. Verify the S3 path matches the folder name in your bucket. |
 | 502 / timeout on first request | The model is still loading. First inference can take 30-60 seconds. |
